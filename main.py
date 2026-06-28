@@ -235,7 +235,14 @@ class EncoderDecoderAdapter(BaseModelAdapter):
             
         if self.is_encoder_decoder:
             self.model = VisionEncoderDecoderModel.from_pretrained(self.repo_id, trust_remote_code=True).to(self.device)
-            self.processor = AutoProcessor.from_pretrained(self.repo_id)
+            try:
+                self.processor = AutoProcessor.from_pretrained(self.repo_id)
+            except Exception as e:
+                if "do_crop_margin" in str(e):
+                    print("Retrying Nougat processor load with do_crop_margin=False override...")
+                    self.processor = AutoProcessor.from_pretrained(self.repo_id, do_crop_margin=False)
+                else:
+                    raise e
         else:
             from transformers import pipeline
             self.model = pipeline(
@@ -258,7 +265,7 @@ class EncoderDecoderAdapter(BaseModelAdapter):
             else:
                 return res[0]["generated_text"]
         else:
-            pixel_values = self.processor(image, return_tensors="pt").pixel_values.to(self.device)
+            pixel_values = self.processor(images=image, return_tensors="pt").pixel_values.to(self.device)
             outputs = self.model.generate(
                 pixel_values,
                 min_length=1,
@@ -275,12 +282,20 @@ class CausalLMAdapter(BaseModelAdapter):
         try:
             self.processor = AutoProcessor.from_pretrained(self.repo_id, trust_remote_code=True)
         except Exception as e:
-            print(f"AutoProcessor failed: {e}. Trying AutoTokenizer...")
-            from transformers import AutoTokenizer
-            try:
-                self.processor = AutoTokenizer.from_pretrained(self.repo_id, trust_remote_code=True)
-            except Exception:
-                self.processor = None
+            if "do_crop_margin" in str(e):
+                print("Retrying CausalLM processor load with do_crop_margin=False override...")
+                try:
+                    self.processor = AutoProcessor.from_pretrained(self.repo_id, trust_remote_code=True, do_crop_margin=False)
+                except Exception as e_inner:
+                    e = e_inner
+            
+            if not hasattr(self, "processor") or self.processor is None:
+                print(f"AutoProcessor failed: {e}. Trying AutoTokenizer...")
+                from transformers import AutoTokenizer
+                try:
+                    self.processor = AutoTokenizer.from_pretrained(self.repo_id, trust_remote_code=True)
+                except Exception:
+                    self.processor = None
                 
         try:
             print("Attempting to load with AutoModelForCausalLM...")
