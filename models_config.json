@@ -1,0 +1,29 @@
+{
+  "recommended": [],
+  "custom": [
+    {
+      "repo_id": "zai-org/GLM-OCR",
+      "name": "GLM-OCR",
+      "category": "Custom Model",
+      "size": "Unknown Size",
+      "description": "User-added custom model.",
+      "family": "glm-ocr"
+    },
+    {
+      "repo_id": "datalab-to/surya-ocr-2",
+      "name": "surya-ocr-2",
+      "category": "Custom Model",
+      "size": "Unknown Size",
+      "description": "User-added custom model.",
+      "family": "vision-encoder-decoder"
+    },
+    {
+      "repo_id": "tiiuae/Falcon-OCR",
+      "name": "Falcon-OCR",
+      "category": "Custom Model",
+      "size": "Unknown Size",
+      "description": "User-added custom model.",
+      "family": "auto"
+    }
+  ]
+}

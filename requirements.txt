@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+pywebview
+pydantic
+pillow
+torch
+transformers
+huggingface_hub
+psutil
+qwen-vl-utils
+pypdfium2
+addict
+easydict
+einops

@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Writing-to-LaTeX Converter | Local Model Harness</title>
+    <meta name="description" content="Convert your handwritten math equations and notes into clean, editable LaTeX using local state-of-the-art Hugging Face OCR models.">
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <!-- KaTeX CSS -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css" crossorigin="anonymous">
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="glass-bg-glow"></div>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="app-header">
+            <div class="header-main-row">
+                <div class="logo-area">
+                    <div class="logo-icon">
+                        <i data-lucide="edit-3"></i>
+                    </div>
+                    <h1>Formu<span class="gradient-text">Latex</span></h1>
+                </div>
+                <!-- Navigation Tabs -->
+                <nav class="app-nav">
+                    <button class="nav-btn active" id="nav-converter">
+                        <i data-lucide="sparkles"></i> Converter
+                    </button>
+                    <button class="nav-btn" id="nav-models">
+                        <i data-lucide="cpu"></i> Model Manager
+                        <span class="active-badge hidden" id="active-model-badge">None</span>
+                    </button>
+                </nav>
+            </div>
+            <p class="subtitle">Convert handwritten equations & notes into LaTeX using local Hugging Face AI models</p>
+        </header>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            
+            <!-- VIEW 1: CONVERTER PANE -->
+            <div id="converterView" class="view-pane">
+                
+                <!-- No Model Loaded Warning Banner -->
+                <section id="noModelWarning" class="card warning-card fade-in">
+                    <div class="warning-container">
+                        <div class="warning-icon-wrapper">
+                            <i data-lucide="alert-circle" class="warning-icon"></i>
+                        </div>
+                        <div class="warning-text-area">
+                            <h3>No Active Model Loaded</h3>
+                            <p>You must download and activate a model in the Model Manager before you can transcribe notes locally.</p>
+                        </div>
+                        <button class="btn btn-primary btn-sm" id="goToModelsBtn">
+                            Go to Model Manager <i data-lucide="arrow-right"></i>
+                        </button>
+                    </div>
+                </section>
+
+                <!-- Upload Panel -->
+                <section id="uploadSection" class="card fade-in">
+                    <div class="dropzone" id="dropzone">
+                        <input type="file" id="fileInput" accept="image/*,application/pdf" style="display: none;">
+                        <div class="dropzone-content">
+                            <div class="upload-icon-wrapper">
+                                <i data-lucide="upload-cloud" class="upload-icon"></i>
+                            </div>
+                            <h3>Upload your handwritten notes</h3>
+                            <p class="dropzone-help">Drag and drop your image or PDF here, or click to browse</p>
+                            <span class="file-formats">Supports PNG, JPG, JPEG, WEBP, and PDF</span>
+                            <div class="active-model-info-banner hidden" id="activeModelInfoBanner">
+                                Running on model: <strong id="activeModelLabel">None</strong>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Loading Panel -->
+                <section id="loadingSection" class="card hidden">
+                    <div class="loading-container">
+                        <div class="spinner-wrapper">
+                            <div class="spinner"></div>
+                            <div class="spinner-inner"></div>
+                        </div>
+                        <h2>Processing Document</h2>
+                        <p class="loading-subtitle">This may take 10-30 seconds depending on model size...</p>
+                        
+                        <div class="progress-steps">
+                            <div class="step active" id="step-upload">
+                                <i data-lucide="check" class="step-check hidden"></i>
+                                <div class="step-dot"></div>
+                                <span>Uploading file</span>
+                            </div>
+                            <div class="step" id="step-ai">
+                                <i data-lucide="check" class="step-check hidden"></i>
+                                <div class="step-dot"></div>
+                                <span id="step-ai-text">Transcribing with local model</span>
+                            </div>
+                            <div class="step" id="step-render">
+                                <i data-lucide="check" class="step-check hidden"></i>
+                                <div class="step-dot"></div>
+                                <span>Compiling LaTeX preview</span>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Error Panel -->
+                <section id="errorSection" class="card hidden error-card">
+                    <div class="error-container">
+                        <div class="error-icon-wrapper">
+                            <i data-lucide="alert-triangle" class="error-icon"></i>
+                        </div>
+                        <h3>Conversion Failed</h3>
+                        <p id="errorMessage" class="error-message">An error occurred during file transcription.</p>
+                        <button class="btn btn-secondary" id="errorResetBtn">
+                            <i data-lucide="rotate-ccw"></i> Try Again
+                        </button>
+                    </div>
+                </section>
+
+                <!-- Results Panel (Workspace) -->
+                <section id="resultsSection" class="workspace-layout hidden">
+                    <!-- Top Toolbar -->
+                    <div class="workspace-header card">
+                        <div class="uploaded-file-info">
+                            <i data-lucide="file-text"></i>
+                            <span id="uploadedFilename">equation.png</span>
+                            <span class="active-model-tag" id="workspaceActiveModelTag">Model</span>
+                        </div>
+                        <div class="workspace-actions">
+                            <button class="btn btn-secondary" id="resetBtn">
+                                <i data-lucide="refresh-cw"></i> Start Over
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Grid Workspace -->
+                    <div class="workspace-grid">
+                        <!-- Left Panel: Raw LaTeX Editor & Image Preview -->
+                        <div class="workspace-column left-col">
+                            <!-- Image Preview Thumbnail Card -->
+                            <div class="card preview-thumbnail-card">
+                                <div class="panel-header">
+                                    <h3><i data-lucide="image"></i> Source Document</h3>
+                                    <button class="icon-btn" id="toggleImageBtn" title="Toggle Source View">
+                                        <i data-lucide="eye-off"></i>
+                                    </button>
+                                </div>
+                                <div class="image-preview-container" id="sourceImagePreviewContainer">
+                                    <img id="sourceImagePreview" src="" alt="Source handwriting">
+                                </div>
+                            </div>
+
+                            <!-- LaTeX Editor Card -->
+                            <div class="card editor-card">
+                                <div class="panel-header">
+                                    <h3><i data-lucide="code-2"></i> LaTeX Code</h3>
+                                    <div class="editor-actions">
+                                        <button class="btn btn-secondary btn-sm" id="copyBtn">
+                                            <i data-lucide="copy"></i> Copy
+                                        </button>
+                                        <button class="btn btn-primary btn-sm" id="downloadBtn">
+                                            <i data-lucide="download"></i> Download .tex
+                                        </button>
+                                    </div>
+                                </div>
+                                <div class="editor-container">
+                                    <textarea id="latexEditor" spellcheck="false" placeholder="Write or edit LaTeX here..."></textarea>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Right Panel: LaTeX Render Preview -->
+                        <div class="workspace-column right-col">
+                            <div class="card preview-card">
+                                <div class="panel-header">
+                                    <h3><i data-lucide="eye"></i> Math Preview</h3>
+                                    <div class="preview-toggles">
+                                        <button class="toggle-btn active" id="displayModeBtn" title="Display Mode (centered, large equations)">
+                                            Display
+                                        </button>
+                                        <button class="toggle-btn" id="inlineModeBtn" title="Inline Mode (compact text equations)">
+                                            Inline
+                                        </button>
+                                    </div>
+                                </div>
+                                
+                                <div class="preview-output-wrapper">
+                                    <div id="latexRenderArea" class="render-area">
+                                        <!-- Rendered math goes here -->
+                                    </div>
+                                    <div id="renderErrorAlert" class="render-error hidden">
+                                        <i data-lucide="info"></i>
+                                        <span id="renderErrorText">Invalid LaTeX syntax</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- VIEW 2: MODEL MANAGER PANE -->
+            <div id="modelsView" class="view-pane hidden">
+                <!-- Grid of System Diags and Custom Loader -->
+                <div class="models-manager-top-grid">
+                    <!-- System Info -->
+                    <div class="card system-diagnostics">
+                        <div class="panel-header">
+                            <h3><i data-lucide="activity"></i> System Info</h3>
+                            <div class="device-info">
+                                <span class="badge" id="device-badge">Device: CPU</span>
+                            </div>
+                        </div>
+                        <div class="diag-grid">
+                            <div class="diag-item">
+                                <div class="diag-label">Active Model</div>
+                                <div class="diag-value text-primary font-bold" id="active-model-name">None</div>
+                            </div>
+                            <div class="diag-item">
+                                <div class="diag-label">RAM Usage</div>
+                                <div class="diag-value text-secondary" id="ram-usage-value">0.0 / 0.0 GB</div>
+                            </div>
+                            <div class="diag-item">
+                                <div class="diag-label">CPU Usage</div>
+                                <div class="diag-value text-secondary" id="cpu-usage-value">0%</div>
+                            </div>
+                        </div>
+
+                    </div>
+
+                    <!-- Custom Model Downloader -->
+                    <div class="card model-downloader-card">
+                        <div class="panel-header">
+                            <h3><i data-lucide="download-cloud"></i> Load Custom / Local Model</h3>
+                        </div>
+                        <form id="customModelForm" class="downloader-form">
+                            <div class="form-row">
+                                <div class="form-group flex-2">
+                                    <label for="customRepoId" id="customRepoIdLabel">Model Repo ID or Local Path (e.g., C:\models\nougat)</label>
+                                    <input type="text" id="customRepoId" placeholder="org/repo or local directory absolute path" required>
+                                </div>
+                                <div class="form-group flex-1">
+                                    <label for="customFamily">Architecture Family</label>
+                                    <select id="customFamily" required>
+                                        <option value="auto" selected>Auto (Universal)</option>
+                                        <option value="vision-encoder-decoder">Vision-Encoder-Decoder (Nougat)</option>
+                                        <option value="got-ocr-2">GOT-OCR 2.0</option>
+                                        <option value="florence-2">Florence-2</option>
+                                        <option value="qwen2-vl">Qwen2-VL</option>
+                                        <option value="glm-ocr">GLM-OCR</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="form-btn-row">
+                                <button type="submit" class="btn btn-primary" id="downloadCustomBtn">
+                                    <i data-lucide="download"></i> Download / Import Model
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+
+                <!-- Global Downloading Progress Panel -->
+                <div id="downloadProgressContainer" class="card download-progress-card hidden">
+                    <div class="progress-info-row">
+                        <div class="repo-details">
+                            <h4 id="downloadingRepoName">Downloading model...</h4>
+                            <span class="speed-badge" id="downloadSpeed">0 KB/s</span>
+                        </div>
+                        <div class="progress-pct-value" id="downloadProgressText">0.0%</div>
+                    </div>
+                    <div class="progress-bar-wrapper">
+                        <div class="progress-bar-fill" id="downloadProgressBarFill" style="width: 0%"></div>
+                    </div>
+                    <div class="progress-footer-row">
+                        <span id="downloadSizeDetails">0 MB / 0 MB</span>
+                        <span class="status-msg text-secondary" id="downloadStatusMsg">Downloading files...</span>
+                    </div>
+                </div>
+
+                <!-- Available Models Header -->
+                <div class="section-title-row">
+                    <h3><i data-lucide="database"></i> Model Registry</h3>
+                    <p class="section-subtitle">Install or activate models locally. Unused models can be deleted to save disk space.</p>
+                </div>
+
+                <!-- Models Grid -->
+                <div class="models-grid" id="modelsGrid">
+                    <!-- Dynamic model items injected here -->
+                </div>
+            </div>
+
+        </main>
+        
+        <footer class="app-footer">
+            <p>FormuLatex Local OCR Harness. Running entirely on local hardware.</p>
+        </footer>
+    </div>
+
+    <!-- KaTeX JS dependency -->
+    <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
