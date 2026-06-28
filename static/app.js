@@ -12,6 +12,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const loadingState = document.getElementById('loadingState');
     const resultState = document.getElementById('resultState');
     
+    const modelSelect = document.getElementById('modelSelect');
+    
     const latexCode = document.getElementById('latexCode');
     const katexPreview = document.getElementById('katexPreview');
     const copyBtn = document.getElementById('copyBtn');
@@ -99,6 +101,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const formData = new FormData();
         formData.append('file', file);
+        if (modelSelect) {
+            formData.append('model', modelSelect.value);
+        }
 
         try {
             const response = await fetch('/api/convert', {

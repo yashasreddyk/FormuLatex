@@ -11,7 +11,7 @@ import threading
 import gc
 import psutil
 from typing import Optional
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -165,16 +165,59 @@ class GlmOcrAdapter(BaseModelAdapter):
             if cleanup_temp and os.path.exists(temp_file_path):
                 os.remove(temp_file_path)
 
+class NougatLatexAdapter(BaseModelAdapter):
+    def _load_impl(self):
+        from transformers import VisionEncoderDecoderModel, AutoProcessor
+        self.model = VisionEncoderDecoderModel.from_pretrained(
+            self.repo_id,
+            device_map="auto" if self.device == "cuda" else None,
+            torch_dtype=torch.bfloat16
+        )
+        if self.device == "cpu":
+            self.model = self.model.to("cpu")
+        self.processor = AutoProcessor.from_pretrained(self.repo_id)
+
+    def generate_stream(self, image, temp_file_path: str = None):
+        from transformers import TextIteratorStreamer
+        from threading import Thread
+
+        pixel_values = self.processor(image, return_tensors="pt").pixel_values.to(self.device)
+        
+        streamer = TextIteratorStreamer(self.processor.tokenizer, skip_prompt=True, skip_special_tokens=True)
+        generation_kwargs = dict(
+            pixel_values=pixel_values,
+            max_new_tokens=1024,
+            streamer=streamer
+        )
+
+        thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
+        thread.start()
+
+        for new_text in streamer:
+            yield new_text
+
 @app.post("/api/convert")
-async def convert_handwriting(file: UploadFile = File(...)):
+async def convert_handwriting(file: UploadFile = File(...), model: str = Form("glm-ocr")):
     global loaded_model
     
     with loaded_lock:
+        target_repo = "zai-org/GLM-OCR" if model == "glm-ocr" else "Norm/nougat-latex-base"
+        
+        if loaded_model is not None and loaded_model.repo_id != target_repo:
+            print(f"Unloading previous model {loaded_model.repo_id}...")
+            loaded_model = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
         if loaded_model is None:
-            print("Loading GLM-OCR model for the first time...")
-            loaded_model = GlmOcrAdapter("zai-org/GLM-OCR")
+            print(f"Loading {target_repo} model...")
+            if model == "glm-ocr":
+                loaded_model = GlmOcrAdapter(target_repo)
+            else:
+                loaded_model = NougatLatexAdapter(target_repo)
             loaded_model.load()
-            print("GLM-OCR model loaded successfully.")
+            print(f"{target_repo} model loaded successfully.")
             
     # Validate file extension
     filename = file.filename
@@ -193,7 +236,7 @@ async def convert_handwriting(file: UploadFile = File(...)):
         with open(temp_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
             
-        print(f"Running OCR using local model adapter: zai-org/GLM-OCR")
+        print(f"Running OCR using local model adapter: {loaded_model.repo_id}")
         
         if ext == ".pdf":
             try:

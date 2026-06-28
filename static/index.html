@@ -35,7 +35,7 @@
             
             <div class="sidebar-footer">
                 <div class="model-badge">
-                    <i data-lucide="cpu"></i> zai-org/GLM-OCR
+                    <i data-lucide="cpu"></i> Local Inference
                 </div>
             </div>
         </aside>
@@ -43,9 +43,11 @@
         <!-- Main Workspace -->
         <main class="main-workspace">
             <div class="workspace-header">
-                <div class="model-selector-pill">
-                    <span>GLM-OCR</span>
-                    <i data-lucide="chevron-down" class="pill-icon"></i>
+                <div class="model-selector-wrapper">
+                    <select id="modelSelect" class="model-select">
+                        <option value="glm-ocr">GLM-OCR</option>
+                        <option value="nougat-latex">Nougat LaTeX Base</option>
+                    </select>
                 </div>
             </div>
             
