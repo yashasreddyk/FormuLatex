@@ -60,6 +60,12 @@ document.addEventListener("DOMContentLoaded", () => {
     const customFamily = document.getElementById("customFamily");
     const downloadCustomBtn = document.getElementById("downloadCustomBtn");
     
+    // Advanced options elements
+    const advancedToggleBtn = document.getElementById("advancedToggleBtn");
+    const advancedDownloaderOptions = document.getElementById("advancedDownloaderOptions");
+    const customPrompt = document.getElementById("customPrompt");
+    const customMaxTokens = document.getElementById("customMaxTokens");
+    
     const downloadProgressContainer = document.getElementById("downloadProgressContainer");
     const downloadingRepoName = document.getElementById("downloadingRepoName");
     const downloadSpeed = document.getElementById("downloadSpeed");
@@ -274,7 +280,7 @@ document.addEventListener("DOMContentLoaded", () => {
     // API CALLS: DOWNLOAD, ACTIVATE, DELETE
     // ----------------------------------------------------------------------
     
-    async function startDownload(repoId, family, name = null) {
+    async function startDownload(repoId, family, name = null, prompt = null, maxNewTokens = null) {
         try {
             downloadProgressContainer.classList.remove("hidden");
             downloadingRepoName.textContent = name || repoId.split("/").pop();
@@ -284,10 +290,18 @@ document.addEventListener("DOMContentLoaded", () => {
             downloadSizeDetails.textContent = "Initializing...";
             downloadStatusMsg.textContent = "Starting HuggingFace snapshot download...";
             
+            const payload = { 
+                repo_id: repoId, 
+                family: family, 
+                name: name 
+            };
+            if (prompt) payload.prompt = prompt;
+            if (maxNewTokens) payload.max_new_tokens = parseInt(maxNewTokens, 10);
+            
             const response = await fetch("/api/models/download", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ repo_id: repoId, family: family, name: name })
+                body: JSON.stringify(payload)
             });
             
             if (!response.ok) {
@@ -392,14 +406,27 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    // Toggle advanced options panel
+    if (advancedToggleBtn) {
+        advancedToggleBtn.addEventListener("click", () => {
+            advancedDownloaderOptions.classList.toggle("hidden");
+        });
+    }
+
     // Custom Model Downloader form submit
     customModelForm.addEventListener("submit", (e) => {
         e.preventDefault();
         const repo = customRepoId.value.trim();
         const family = customFamily.value;
+        const prompt = customPrompt ? customPrompt.value.trim() : null;
+        const maxTokens = (customMaxTokens && customMaxTokens.value) ? customMaxTokens.value : null;
+        
         if (repo) {
-            startDownload(repo, family);
+            startDownload(repo, family, null, prompt, maxTokens);
             customRepoId.value = "";
+            if (customPrompt) customPrompt.value = "";
+            if (customMaxTokens) customMaxTokens.value = "";
+            if (advancedDownloaderOptions) advancedDownloaderOptions.classList.add("hidden");
         }
     });
 

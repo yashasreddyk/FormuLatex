@@ -76,6 +76,8 @@ class DownloadRequest(BaseModel):
     category: Optional[str] = None
     description: Optional[str] = None
     size: Optional[str] = None
+    prompt: Optional[str] = None
+    max_new_tokens: Optional[int] = None
 
 # Global model state
 loaded_model_repo_id = None
@@ -83,6 +85,7 @@ loaded_model = None
 loaded_processor = None
 loaded_architecture = None
 loaded_device = None
+loaded_adapter = None
 loaded_lock = threading.Lock()
 
 class ActivateRequest(BaseModel):
@@ -154,6 +157,441 @@ def run_download_thread(repo_id: str, total_size: int):
                     "status": "failed",
                     "error": str(e)
                 })
+
+
+# ----------------------------------------------------------------------
+# MODEL ADAPTERS (Strategy Pattern)
+# ----------------------------------------------------------------------
+
+class BaseModelAdapter:
+    def __init__(self, config_meta: dict):
+        self.config_meta = config_meta
+        self.repo_id = None
+        self.device = None
+
+    def load(self, repo_id: str, device: str):
+        self.repo_id = repo_id
+        self.device = device
+        import transformers.utils.import_utils
+        if not hasattr(transformers.utils.import_utils, 'is_torch_fx_available'):
+            transformers.utils.import_utils.is_torch_fx_available = lambda: False
+        self._load_impl()
+
+    def _load_impl(self):
+        raise NotImplementedError()
+
+    def generate(self, image, temp_file_path: str = None) -> str:
+        raise NotImplementedError()
+
+
+class PipelineAdapter(BaseModelAdapter):
+    def _load_impl(self):
+        from transformers.pipelines import get_task
+        from transformers import pipeline
+        
+        self.task = self.config_meta.get("task")
+        if not self.task:
+            try:
+                self.task = get_task(self.repo_id)
+            except Exception:
+                self.task = "image-text-to-text"
+                
+        if self.task not in ["image-to-text", "image-text-to-text"]:
+            self.task = "image-text-to-text"
+            
+        print(f"Loading via pipeline with task: {self.task}...")
+        self.pipeline = pipeline(
+            self.task,
+            model=self.repo_id,
+            device=0 if self.device == "cuda" else -1,
+            trust_remote_code=True
+        )
+
+    def generate(self, image, temp_file_path: str = None) -> str:
+        if self.task == "image-to-text":
+            res = self.pipeline(image)
+            return res[0]["generated_text"]
+        else:
+            prompt = self.config_meta.get("prompt") or "Extract math equations to LaTeX format:"
+            messages = [
+                {"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": prompt}]}
+            ]
+            res = self.pipeline(messages)
+            if isinstance(res[0]["generated_text"], list):
+                return res[0]["generated_text"][-1]["content"]
+            else:
+                return res[0]["generated_text"]
+
+
+class EncoderDecoderAdapter(BaseModelAdapter):
+    def _load_impl(self):
+        from transformers import VisionEncoderDecoderModel, AutoProcessor, AutoConfig
+        
+        try:
+            model_config = AutoConfig.from_pretrained(self.repo_id, trust_remote_code=True)
+            self.is_encoder_decoder = getattr(model_config, "is_encoder_decoder", False) or model_config.__class__.__name__ == "VisionEncoderDecoderConfig"
+        except Exception:
+            self.is_encoder_decoder = True
+            
+        if self.is_encoder_decoder:
+            self.model = VisionEncoderDecoderModel.from_pretrained(self.repo_id, trust_remote_code=True).to(self.device)
+            self.processor = AutoProcessor.from_pretrained(self.repo_id)
+        else:
+            from transformers import pipeline
+            self.model = pipeline(
+                "image-text-to-text",
+                model=self.repo_id,
+                device=0 if self.device == "cuda" else -1,
+                trust_remote_code=True
+            )
+            self.processor = None
+
+    def generate(self, image, temp_file_path: str = None) -> str:
+        if self.processor is None:
+            prompt = self.config_meta.get("prompt") or "Extract math equations to LaTeX format:"
+            messages = [
+                {"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": prompt}]}
+            ]
+            res = self.model(messages)
+            if isinstance(res[0]["generated_text"], list):
+                return res[0]["generated_text"][-1]["content"]
+            else:
+                return res[0]["generated_text"]
+        else:
+            pixel_values = self.processor(image, return_tensors="pt").pixel_values.to(self.device)
+            outputs = self.model.generate(
+                pixel_values,
+                min_length=1,
+                max_new_tokens=int(self.config_meta.get("max_new_tokens") or 1024),
+            )
+            return self.processor.batch_decode(outputs, skip_special_tokens=True)[0]
+
+
+class CausalLMAdapter(BaseModelAdapter):
+    def _load_impl(self):
+        import torch
+        from transformers import AutoModelForCausalLM, AutoModel, AutoProcessor
+        
+        try:
+            self.processor = AutoProcessor.from_pretrained(self.repo_id, trust_remote_code=True)
+        except Exception as e:
+            print(f"AutoProcessor failed: {e}. Trying AutoTokenizer...")
+            from transformers import AutoTokenizer
+            try:
+                self.processor = AutoTokenizer.from_pretrained(self.repo_id, trust_remote_code=True)
+            except Exception:
+                self.processor = None
+                
+        try:
+            print("Attempting to load with AutoModelForCausalLM...")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.repo_id,
+                device_map="auto" if self.device == "cuda" else None,
+                trust_remote_code=True
+            )
+        except Exception as e:
+            print(f"AutoModelForCausalLM failed: {e}. Trying generic AutoModel...")
+            try:
+                self.model = AutoModel.from_pretrained(
+                    self.repo_id,
+                    device_map="auto" if self.device == "cuda" else None,
+                    trust_remote_code=True
+                )
+            except Exception as e2:
+                print(f"AutoModel failed: {e2}. Attempting to manually fix config & load...")
+                from transformers import AutoConfig
+                cfg = AutoConfig.from_pretrained(self.repo_id, trust_remote_code=True)
+                if not hasattr(cfg, 'pad_token_id'):
+                    cfg.pad_token_id = getattr(cfg, 'eos_token_id', None)
+                self.model = AutoModel.from_pretrained(
+                    self.repo_id,
+                    config=cfg,
+                    device_map="auto" if self.device == "cuda" else None,
+                    trust_remote_code=True
+                )
+        
+        if self.device == "cpu" and hasattr(self.model, "to"):
+            self.model = self.model.to("cpu")
+
+    def generate(self, image, temp_file_path: str = None) -> str:
+        prompt_text = self.config_meta.get("prompt") or "Convert this equation to LaTeX:"
+        
+        if self.processor and hasattr(self.processor, "apply_chat_template"):
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": prompt_text}
+                    ]
+                }
+            ]
+            try:
+                img_input = temp_file_path if temp_file_path else image
+                messages[0]["content"][0]["image"] = img_input
+                text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                inputs = self.processor(text=[text], images=[image], padding=True, return_tensors="pt").to(self.device)
+                
+                if hasattr(self.model, "generate"):
+                    generated_ids = self.model.generate(
+                        **inputs, 
+                        max_new_tokens=int(self.config_meta.get("max_new_tokens") or 1024)
+                    )
+                    generated_ids_trimmed = [
+                        out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+                    ]
+                    return self.processor.batch_decode(
+                        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                    )[0]
+            except Exception as e:
+                print(f"Chat template processing failed: {e}. Falling back to simple format...")
+                
+        if self.processor:
+            try:
+                inputs = self.processor(images=image, text=prompt_text, return_tensors="pt").to(self.device)
+            except Exception:
+                inputs = self.processor(images=image, return_tensors="pt").to(self.device)
+        else:
+            inputs = {}
+            
+        if hasattr(self.model, "generate"):
+            inputs_on_device = {k: v.to(self.device) if hasattr(v, "to") else v for k, v in inputs.items()}
+            generated_ids = self.model.generate(
+                **inputs_on_device,
+                max_new_tokens=int(self.config_meta.get("max_new_tokens") or 1024)
+            )
+            if self.processor and hasattr(self.processor, "batch_decode"):
+                return self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            elif self.processor and hasattr(self.processor, "decode"):
+                return self.processor.decode(generated_ids[0], skip_special_tokens=True)
+            else:
+                return str(generated_ids)
+        else:
+            return "Error: Loaded model does not support generation (generate method is missing)."
+
+
+class GotOcrAdapter(BaseModelAdapter):
+    def _load_impl(self):
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+        self.model = AutoModelForImageTextToText.from_pretrained(
+            self.repo_id,
+            device_map="auto" if self.device == "cuda" else None,
+            trust_remote_code=True
+        )
+        if self.device == "cpu":
+            self.model = self.model.to("cpu")
+        self.processor = AutoProcessor.from_pretrained(self.repo_id, trust_remote_code=True)
+
+    def generate(self, image, temp_file_path: str = None) -> str:
+        inputs = self.processor(images=image, return_tensors="pt").to(self.device)
+        generate_ids = self.model.generate(
+            **inputs,
+            do_sample=False,
+            tokenizer=self.processor.tokenizer,
+            stop_strings="<|im_end|>",
+            max_new_tokens=int(self.config_meta.get("max_new_tokens") or 4096)
+        )
+        return self.processor.decode(generate_ids[0], skip_special_tokens=True)
+
+
+class Florence2Adapter(BaseModelAdapter):
+    def _load_impl(self):
+        from transformers import AutoModelForCausalLM, AutoProcessor
+        self.model = AutoModelForCausalLM.from_pretrained(self.repo_id, trust_remote_code=True).to(self.device)
+        self.processor = AutoProcessor.from_pretrained(self.repo_id, trust_remote_code=True)
+
+    def generate(self, image, temp_file_path: str = None) -> str:
+        prompt = self.config_meta.get("prompt") or "<OCR>"
+        inputs = self.processor(text=prompt, images=image, return_tensors="pt").to(self.device)
+        generated_ids = self.model.generate(
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["pixel_values"],
+            max_new_tokens=int(self.config_meta.get("max_new_tokens") or 1024),
+            num_beams=3
+        )
+        generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        parsed_answer = self.processor.post_process_generation(generated_text, task=prompt, image_size=(image.width, image.height))
+        return parsed_answer[prompt]
+
+
+class Qwen2VLAdapter(BaseModelAdapter):
+    def _load_impl(self):
+        from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+            self.repo_id,
+            device_map="auto" if self.device == "cuda" else None
+        )
+        if self.device == "cpu":
+            self.model = self.model.to("cpu")
+        self.processor = AutoProcessor.from_pretrained(self.repo_id)
+
+    def generate(self, image, temp_file_path: str = None) -> str:
+        prompt = self.config_meta.get("prompt") or "Convert this handwriting image or equation into LaTeX code. Output ONLY the LaTeX code, no other text."
+        import tempfile, os
+        cleanup_temp = False
+        if not temp_file_path:
+            temp_dir = tempfile.gettempdir()
+            temp_file_path = os.path.join(temp_dir, f"qwen_temp_{os.urandom(8).hex()}.png")
+            image.save(temp_file_path)
+            cleanup_temp = True
+            
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": temp_file_path},
+                    {"type": "text", "text": prompt}
+                ]
+            }
+        ]
+        try:
+            text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            from qwen_vl_utils import process_vision_info
+            image_inputs, video_inputs, *rest = process_vision_info(messages)
+            inputs = self.processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt"
+            ).to(self.device)
+            
+            generated_ids = self.model.generate(
+                **inputs, 
+                max_new_tokens=int(self.config_meta.get("max_new_tokens") or 2048)
+            )
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            return self.processor.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )[0]
+        finally:
+            if cleanup_temp and os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+
+
+class GlmOcrAdapter(BaseModelAdapter):
+    def _load_impl(self):
+        from transformers import AutoProcessor
+        try:
+            from transformers import GlmOcrForConditionalGeneration
+        except ImportError:
+            from fastapi import HTTPException
+            raise HTTPException(
+                status_code=500, 
+                detail="GLM-OCR requires a newer version of transformers. Please run: pip install git+https://github.com/huggingface/transformers.git and restart the app."
+            )
+        self.model = GlmOcrForConditionalGeneration.from_pretrained(
+            self.repo_id,
+            device_map="auto" if self.device == "cuda" else None,
+            trust_remote_code=True
+        )
+        if self.device == "cpu":
+            self.model = self.model.to("cpu")
+        self.processor = AutoProcessor.from_pretrained(self.repo_id, trust_remote_code=True)
+
+    def generate(self, image, temp_file_path: str = None) -> str:
+        prompt = self.config_meta.get("prompt") or "Formula Recognition:"
+        
+        import tempfile, os
+        cleanup_temp = False
+        if not temp_file_path:
+            temp_dir = tempfile.gettempdir()
+            temp_file_path = os.path.join(temp_dir, f"glm_temp_{os.urandom(8).hex()}.png")
+            image.save(temp_file_path)
+            cleanup_temp = True
+            
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "url": temp_file_path},
+                    {"type": "text", "text": prompt}
+                ]
+            }
+        ]
+        try:
+            inputs = self.processor.apply_chat_template(
+                messages,
+                return_dict=True,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt"
+            ).to(self.device)
+            generated_ids = self.model.generate(
+                **inputs, 
+                max_new_tokens=int(self.config_meta.get("max_new_tokens") or 2048)
+            )
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            return self.processor.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )[0]
+        finally:
+            if cleanup_temp and os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+
+
+ADAPTER_MAP = {
+    "auto": PipelineAdapter,
+    "vision-encoder-decoder": EncoderDecoderAdapter,
+    "generic-causal-lm": CausalLMAdapter,
+    "got-ocr-2": GotOcrAdapter,
+    "florence-2": Florence2Adapter,
+    "qwen2-vl": Qwen2VLAdapter,
+    "glm-ocr": GlmOcrAdapter
+}
+
+
+def detect_model_family(repo_id: str) -> str:
+    from huggingface_hub import hf_hub_download
+    import json
+    
+    if os.path.isdir(repo_id):
+        config_path = os.path.join(repo_id, "config.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                return _infer_family_from_config(cfg)
+            except Exception:
+                pass
+        return "auto"
+        
+    try:
+        cfg_file = hf_hub_download(repo_id, "config.json")
+        with open(cfg_file, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return _infer_family_from_config(cfg)
+    except Exception as e:
+        print(f"Could not auto-detect model family for {repo_id}: {e}")
+        return "auto"
+
+
+def _infer_family_from_config(cfg: dict) -> str:
+    model_type = cfg.get("model_type", "").lower()
+    architectures = cfg.get("architectures", [])
+    arch_name = architectures[0].lower() if architectures else ""
+    
+    if "gotocr" in model_type or "gotocr" in arch_name:
+        return "got-ocr-2"
+    if "florence" in model_type or "florence" in arch_name:
+        return "florence-2"
+    if "qwen2_vl" in model_type or "qwen2vl" in arch_name:
+        return "qwen2-vl"
+    if "glmocr" in model_type or "glmocr" in arch_name:
+        return "glm-ocr"
+    
+    is_enc_dec = cfg.get("is_encoder_decoder", False)
+    if is_enc_dec or "encoderdecoder" in arch_name:
+        return "vision-encoder-decoder"
+        
+    if "causal" in arch_name or "lm" in arch_name or "conditionalgeneration" in arch_name:
+        return "generic-causal-lm"
+        
+    return "auto"
 
 
 @app.get("/api/models")
@@ -253,8 +691,12 @@ async def download_model(req: DownloadRequest, background_tasks: BackgroundTasks
     repo_id = req.repo_id
     
     # Validate family
-    if req.family not in ["auto", "vision-encoder-decoder", "got-ocr-2", "florence-2", "qwen2-vl", "glm-ocr"]:
+    if req.family not in ["auto", "vision-encoder-decoder", "got-ocr-2", "florence-2", "qwen2-vl", "glm-ocr", "generic-causal-lm", "detect"]:
         raise HTTPException(status_code=400, detail="Invalid architecture family.")
+        
+    family = req.family
+    if family == "detect":
+        family = detect_model_family(repo_id)
         
     # Check if this looks like a local path format or is already a directory
     is_local_format = ":" in repo_id or "\\" in repo_id or repo_id.startswith("/") or repo_id.startswith(".")
@@ -285,7 +727,9 @@ async def download_model(req: DownloadRequest, background_tasks: BackgroundTasks
                 "category": req.category or "Local Import",
                 "size": req.size or "Calculating...",
                 "description": req.description or f"Locally imported model from {repo_id}",
-                "family": req.family
+                "family": family,
+                "prompt": req.prompt,
+                "max_new_tokens": req.max_new_tokens
             }
             config["custom"].append(custom_model)
             save_config(config)
@@ -305,7 +749,9 @@ async def download_model(req: DownloadRequest, background_tasks: BackgroundTasks
             "category": req.category or "Custom Model",
             "size": req.size or "Unknown Size",
             "description": req.description or "User-added custom model.",
-            "family": req.family
+            "family": family,
+            "prompt": req.prompt,
+            "max_new_tokens": req.max_new_tokens
         }
         config["custom"].append(custom_model)
         save_config(config)
@@ -350,13 +796,13 @@ async def get_download_status(repo_id: str):
 
 @app.post("/api/models/activate")
 async def activate_model(req: ActivateRequest):
-    global loaded_model_repo_id, loaded_model, loaded_processor, loaded_architecture, loaded_device
+    global loaded_model_repo_id, loaded_model, loaded_processor, loaded_architecture, loaded_device, loaded_adapter
     
     repo_id = req.repo_id
     
     # Check if already loaded
     with loaded_lock:
-        if loaded_model_repo_id == repo_id and loaded_model is not None:
+        if loaded_model_repo_id == repo_id and loaded_adapter is not None:
             return {"success": True, "message": f"Model {repo_id} is already loaded."}
             
     # Find model metadata in config
@@ -376,7 +822,7 @@ async def activate_model(req: ActivateRequest):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     try:
-        print(f"Loading model {repo_id} on {device}...")
+        print(f"Loading model {repo_id} on {device} using Strategy Pattern...")
         
         # Unload previous model first
         with loaded_lock:
@@ -385,109 +831,29 @@ async def activate_model(req: ActivateRequest):
             loaded_model_repo_id = None
             loaded_architecture = None
             loaded_device = None
+            loaded_adapter = None
             
         gc.collect()
         if device == "cuda":
             torch.cuda.empty_cache()
             
-        # Import libraries dynamically to avoid memory footprint on startup
-        from transformers import (
-            VisionEncoderDecoderModel,
-            AutoProcessor,
-            AutoModelForImageTextToText,
-            AutoModelForCausalLM,
-            Qwen2VLForConditionalGeneration
-        )
-        
-        if family == "auto":
-            from transformers.pipelines import get_task
-            from transformers import pipeline
-            try:
-                task = get_task(repo_id)
-            except Exception:
-                task = "image-text-to-text" # Default fallback for modern VLMs
-            
-            # If the task isn't one of the vision text tasks, we fallback to image-text-to-text
-            if task not in ["image-to-text", "image-text-to-text"]:
-                task = "image-text-to-text"
-                
-            print(f"Auto architecture detected. Loading via Hugging Face pipeline (task: {task})...")
-            new_model = pipeline(
-                task,
-                model=repo_id,
-                device=0 if device == "cuda" else -1,
-                trust_remote_code=True
-            )
-            # Store the task type in new_processor so we know how to invoke it later
-            new_processor = f"pipeline:{task}"
-
-        elif family == "vision-encoder-decoder":
-            from transformers import AutoConfig
-            try:
-                print("Checking model config for vision-encoder-decoder family...")
-                model_config = AutoConfig.from_pretrained(repo_id, trust_remote_code=True)
-                is_encoder_decoder = getattr(model_config, "is_encoder_decoder", False) or model_config.__class__.__name__ == "VisionEncoderDecoderConfig"
-            except Exception as e:
-                print(f"Failed to load config: {e}. Defaulting to standard model class loading.")
-                is_encoder_decoder = True
-                
-            if is_encoder_decoder:
-                print("Loading as standard VisionEncoderDecoderModel...")
-                new_model = VisionEncoderDecoderModel.from_pretrained(repo_id).to(device)
-                new_processor = AutoProcessor.from_pretrained(repo_id)
-            else:
-                # Custom model (e.g. DeepSeek/CausalLM/custom model types)
-                from transformers import pipeline
-                print("Custom model architecture detected. Loading via Hugging Face pipeline...")
-                new_model = pipeline(
-                    "image-text-to-text",
-                    model=repo_id,
-                    device=0 if device == "cuda" else -1,
-                    trust_remote_code=True
-                )
-                new_processor = "pipeline:image-text-to-text"
-        elif family == "got-ocr-2":
-            new_model = AutoModelForImageTextToText.from_pretrained(
-                repo_id, 
-                device_map="auto" if device == "cuda" else None,
-                trust_remote_code=True
-            )
-            if device == "cpu":
-                new_model = new_model.to("cpu")
-            new_processor = AutoProcessor.from_pretrained(repo_id, trust_remote_code=True)
-        elif family == "florence-2":
-            new_model = AutoModelForCausalLM.from_pretrained(repo_id, trust_remote_code=True).to(device)
-            new_processor = AutoProcessor.from_pretrained(repo_id, trust_remote_code=True)
-        elif family == "qwen2-vl":
-            new_model = Qwen2VLForConditionalGeneration.from_pretrained(
-                repo_id,
-                device_map="auto" if device == "cuda" else None
-            )
-            if device == "cpu":
-                new_model = new_model.to("cpu")
-            new_processor = AutoProcessor.from_pretrained(repo_id)
-        elif family == "glm-ocr":
-            try:
-                from transformers import GlmOcrForConditionalGeneration
-            except ImportError:
-                raise HTTPException(
-                    status_code=500, 
-                    detail="GLM-OCR requires a newer version of transformers. Please run: pip install git+https://github.com/huggingface/transformers.git and restart the app."
-                )
-            new_model = GlmOcrForConditionalGeneration.from_pretrained(
-                repo_id,
-                device_map="auto" if device == "cuda" else None,
-                trust_remote_code=True
-            )
-            if device == "cpu":
-                new_model = new_model.to("cpu")
-            new_processor = AutoProcessor.from_pretrained(repo_id, trust_remote_code=True)
-        else:
+        adapter_cls = ADAPTER_MAP.get(family)
+        if not adapter_cls:
             raise HTTPException(status_code=400, detail=f"Unsupported architecture family: {family}")
             
+        adapter = adapter_cls(model_meta)
+        adapter.load(repo_id, device)
+        
         with loaded_lock:
-            loaded_model = new_model
-            loaded_processor = new_processor
+            loaded_adapter = adapter
+            # Maintain backward compatibility with global variables
+            if hasattr(adapter, "pipeline"):
+                loaded_model = adapter.pipeline
+                loaded_processor = f"pipeline:{adapter.task}"
+            else:
+                loaded_model = getattr(adapter, "model", None)
+                loaded_processor = getattr(adapter, "processor", None)
+                
             loaded_model_repo_id = repo_id
             loaded_architecture = family
             loaded_device = device
@@ -497,6 +863,8 @@ async def activate_model(req: ActivateRequest):
         
     except Exception as e:
         print(f"Error loading model {repo_id}: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to load model: {str(e)}")
 
 @app.delete("/api/models")
@@ -541,9 +909,9 @@ async def delete_model(repo_id: str):
 
 @app.post("/api/convert")
 async def convert_handwriting(file: UploadFile = File(...)):
-    global loaded_model, loaded_processor, loaded_architecture, loaded_device
+    global loaded_adapter
     
-    if loaded_model is None or loaded_processor is None:
+    if loaded_adapter is None:
         raise HTTPException(
             status_code=400,
             detail="No local model loaded. Please go to the Model Manager to download and activate a model first."
@@ -566,7 +934,7 @@ async def convert_handwriting(file: UploadFile = File(...)):
         with open(temp_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
             
-        print(f"Running OCR using local model: {loaded_model_repo_id} ({loaded_architecture})")
+        print(f"Running OCR using local model adapter: {loaded_model_repo_id} ({loaded_architecture})")
         
         if ext == ".pdf":
             try:
@@ -596,117 +964,8 @@ async def convert_handwriting(file: UploadFile = File(...)):
         else:
             image = Image.open(temp_file_path).convert("RGB")
         
-        if loaded_architecture in ["vision-encoder-decoder", "auto"]:
-            if isinstance(loaded_processor, str) and loaded_processor.startswith("pipeline"):
-                task = loaded_processor.split(":")[1] if ":" in loaded_processor else "image-text-to-text"
-                print(f"Running OCR using Hugging Face pipeline (task: {task})...")
-                
-                if task == "image-to-text":
-                    res = loaded_model(image)
-                    latex_text = res[0]["generated_text"]
-                else:
-                    # image-text-to-text
-                    messages = [
-                        {"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": "Extract math equations to LaTeX format:"}]}
-                    ]
-                    res = loaded_model(messages)
-                    # Parse output format depending on pipeline version
-                    if isinstance(res[0]["generated_text"], list):
-                        latex_text = res[0]["generated_text"][-1]["content"]
-                    else:
-                        latex_text = res[0]["generated_text"]
-            elif loaded_architecture == "vision-encoder-decoder":
-                pixel_values = loaded_processor(image, return_tensors="pt").pixel_values.to(loaded_device)
-                outputs = loaded_model.generate(
-                    pixel_values,
-                    min_length=1,
-                    max_new_tokens=1024,
-                )
-                latex_text = loaded_processor.batch_decode(outputs, skip_special_tokens=True)[0]
-            
-        elif loaded_architecture == "got-ocr-2":
-            inputs = loaded_processor(images=image, return_tensors="pt").to(loaded_device)
-            generate_ids = loaded_model.generate(
-                **inputs,
-                do_sample=False,
-                tokenizer=loaded_processor.tokenizer,
-                stop_strings="<|im_end|>",
-                max_new_tokens=4096
-            )
-            latex_text = loaded_processor.decode(generate_ids[0], skip_special_tokens=True)
-            
-        elif loaded_architecture == "florence-2":
-            prompt = "<OCR>"
-            inputs = loaded_processor(text=prompt, images=image, return_tensors="pt").to(loaded_device)
-            generated_ids = loaded_model.generate(
-                input_ids=inputs["input_ids"],
-                pixel_values=inputs["pixel_values"],
-                max_new_tokens=1024,
-                num_beams=3
-            )
-            generated_text = loaded_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            parsed_answer = loaded_processor.post_process_generation(generated_text, task=prompt, image_size=(image.width, image.height))
-            latex_text = parsed_answer[prompt]
-            
-        elif loaded_architecture == "qwen2-vl":
-            prompt = "Convert this handwriting image or equation into LaTeX code. Output ONLY the LaTeX code, no other text."
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": temp_file_path},
-                        {"type": "text", "text": prompt}
-                    ]
-                }
-            ]
-            text = loaded_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            
-            from qwen_vl_utils import process_vision_info
-            image_inputs, video_inputs, *rest = process_vision_info(messages)
-            inputs = loaded_processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt"
-            ).to(loaded_device)
-            
-            generated_ids = loaded_model.generate(**inputs, max_new_tokens=2048)
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            latex_text = loaded_processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )[0]
-            
-        elif loaded_architecture == "glm-ocr":
-            prompt = "Formula Recognition:"
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "url": temp_file_path},
-                        {"type": "text", "text": prompt}
-                    ]
-                }
-            ]
-            inputs = loaded_processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt"
-            ).to(loaded_device)
-            generated_ids = loaded_model.generate(**inputs, max_new_tokens=2048)
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            latex_text = loaded_processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )[0]
-            
-        else:
-            raise Exception(f"Unsupported architecture family: {loaded_architecture}")
+        # Invoke adapter to run model inference
+        latex_text = loaded_adapter.generate(image, temp_file_path)
             
         print("Inference completed successfully.")
         

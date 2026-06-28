@@ -250,7 +250,9 @@
                                 <div class="form-group flex-1">
                                     <label for="customFamily">Architecture Family</label>
                                     <select id="customFamily" required>
-                                        <option value="auto" selected>Auto (Universal)</option>
+                                        <option value="detect" selected>Auto-Detect Family</option>
+                                        <option value="auto">Standard HF Pipeline</option>
+                                        <option value="generic-causal-lm">Generic Causal VLM</option>
                                         <option value="vision-encoder-decoder">Vision-Encoder-Decoder (Nougat)</option>
                                         <option value="got-ocr-2">GOT-OCR 2.0</option>
                                         <option value="florence-2">Florence-2</option>
@@ -259,6 +261,25 @@
                                     </select>
                                 </div>
                             </div>
+                            
+                            <div class="advanced-toggle" id="advancedToggleBtn">
+                                <i data-lucide="sliders"></i>
+                                <span>Advanced Options (Optional)</span>
+                            </div>
+                            
+                            <div id="advancedDownloaderOptions" class="advanced-options-panel hidden">
+                                <div class="form-row">
+                                    <div class="form-group flex-2">
+                                        <label for="customPrompt">Custom Prompt / Instruction</label>
+                                        <input type="text" id="customPrompt" placeholder="e.g., Convert this handwriting image or equation into LaTeX code.">
+                                    </div>
+                                    <div class="form-group flex-1">
+                                        <label for="customMaxTokens">Max New Tokens</label>
+                                        <input type="number" id="customMaxTokens" placeholder="e.g., 2048" min="1" max="8192">
+                                    </div>
+                                </div>
+                            </div>
+
                             <div class="form-btn-row">
                                 <button type="submit" class="btn btn-primary" id="downloadCustomBtn">
                                     <i data-lucide="download"></i> Download / Import Model
